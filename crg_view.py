@@ -18,6 +18,8 @@ Usage:
     python crg_view.py road.crg
     python crg_view.py road.crg --zscale 10 --max-points 400
     python crg_view.py road.crg --mode uv --save road.png
+    python crg_view.py road.crg --export road.ply          # point cloud for CloudCompare
+    python crg_view.py road.crg --export road.ply --mesh   # triangulated surface
 """
 
 import argparse
@@ -268,6 +270,67 @@ def read_crg(path):
 
 
 # --------------------------------------------------------------------------
+# export
+# --------------------------------------------------------------------------
+
+def export_cloud(crg, path, step=1, mesh=False):
+    """Write the road surface as a point cloud (or mesh) for CloudCompare etc.
+
+    .ply : binary PLY, double x/y/z plus u and v as scalar fields; with
+           mesh=True also triangle faces
+    .xyz, .txt, .csv : ASCII columns x y z u v
+    step decimates the grid (every step-th point in u and v).
+    Returns the number of points written.
+    """
+    sl = (slice(None, None, step), slice(None, None, step))
+    X, Y, Z = crg["X"][sl], crg["Y"][sl], crg["Z"][sl]
+    U, V = np.meshgrid(crg["u"][::step], crg["v"][::step], indexing="ij")
+    ok = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z)
+    n = int(ok.sum())
+    ext = path.lower().rsplit(".", 1)[-1]
+
+    if ext in ("xyz", "txt", "csv"):
+        if mesh:
+            raise ValueError("--mesh needs a .ply file")
+        sep = "," if ext == "csv" else " "
+        cols = np.column_stack([X[ok], Y[ok], Z[ok], U[ok], V[ok]])
+        np.savetxt(path, cols, fmt="%.6f", delimiter=sep,
+                   header=sep.join("xyzuv"), comments="//" if ext != "csv" else "")
+        return n
+    if ext != "ply":
+        raise ValueError(f"unsupported export format '.{ext}' (use .ply, .xyz, .txt or .csv)")
+
+    verts = np.empty(n, dtype=[("x", "<f8"), ("y", "<f8"), ("z", "<f8"), ("u", "<f4"), ("v", "<f4")])
+    verts["x"], verts["y"], verts["z"], verts["u"], verts["v"] = X[ok], Y[ok], Z[ok], U[ok], V[ok]
+
+    faces = None
+    if mesh:  # two triangles per grid cell whose four corners are valid
+        vid = np.full(ok.shape, -1, dtype=np.int64)
+        vid[ok] = np.arange(n)
+        a, b, c, d = vid[:-1, :-1], vid[1:, :-1], vid[1:, 1:], vid[:-1, 1:]
+        cell = (a >= 0) & (b >= 0) & (c >= 0) & (d >= 0)
+        tri = np.concatenate([np.stack([a[cell], b[cell], c[cell]], -1),
+                              np.stack([a[cell], c[cell], d[cell]], -1)])
+        faces = np.empty(len(tri), dtype=[("n", "u1"), ("i", "<i4", (3,))])
+        faces["n"], faces["i"] = 3, tri
+
+    header = ["ply", "format binary_little_endian 1.0",
+              "comment exported from OpenCRG by crg_view.py",
+              f"element vertex {n}",
+              "property double x", "property double y", "property double z",
+              "property float u", "property float v"]
+    if faces is not None:
+        header += [f"element face {len(faces)}", "property list uchar int vertex_indices"]
+    header.append("end_header")
+    with open(path, "wb") as fh:
+        fh.write(("\n".join(header) + "\n").encode("ascii"))
+        verts.tofile(fh)
+        if faces is not None:
+            faces.tofile(fh)
+    return n
+
+
+# --------------------------------------------------------------------------
 # plotting
 # --------------------------------------------------------------------------
 
@@ -327,6 +390,12 @@ def main(argv=None):
                     help="max mesh points per direction (decimates large grids)")
     ap.add_argument("--cmap", default="viridis", help="matplotlib colormap")
     ap.add_argument("--save", metavar="PNG", help="write an image instead of opening a window")
+    ap.add_argument("--export", metavar="FILE",
+                    help="export the surface as a point cloud (.ply, .xyz, .txt, .csv) and exit")
+    ap.add_argument("--step", type=int, default=1,
+                    help="export every STEP-th grid point in u and v (default 1 = full resolution)")
+    ap.add_argument("--mesh", action="store_true", help="with --export to .ply: also write triangle faces")
+    ap.add_argument("--show", action="store_true", help="with --export: also open the 3D plot")
     args = ap.parse_args(argv)
 
     crg = read_crg(args.file)
@@ -334,6 +403,11 @@ def main(argv=None):
     print(f"{args.file}: format {crg['format']}, {len(u)} x {len(v)} points, "
           f"u = {u[0]:.3f} .. {u[-1]:.3f} m, v = {v[0]:.3f} .. {v[-1]:.3f} m, "
           f"z = {np.nanmin(Z):.4f} .. {np.nanmax(Z):.4f} m")
+    if args.export:
+        n = export_cloud(crg, args.export, step=max(1, args.step), mesh=args.mesh)
+        print(f"wrote {n} points to {args.export}")
+        if not args.show:
+            return 0
     plot_crg(crg, title=args.file.replace("\\", "/").split("/")[-1], mode=args.mode,
              zscale=args.zscale, max_points=args.max_points, cmap=args.cmap, save=args.save)
 
